@@ -1,4 +1,4 @@
-using LedDisplayer.Services;
+using KellermanSoftware.CompareNetObjects;
 using Serilog;
 using StackExchange.Redis;
 
@@ -10,7 +10,9 @@ internal static class Program
     {
         Log.Logger = new LoggerConfiguration()
             .Enrich.FromLogContext()
-            .WriteTo.Console()
+            .WriteTo.Console(outputTemplate: "[{Timestamp:yyyy-MM-dd HH:mm:ss.fff zzz} {Level:u3}] ┊ {Message:lj}{NewLine}{Exception}",
+                applyThemeToRedirectedOutput: true,
+                syncRoot: Contracts.SyncRoot)
             .CreateLogger();
 
         try
@@ -21,6 +23,9 @@ internal static class Program
                 ContentRootPath = AppDomain.CurrentDomain.BaseDirectory
             });
 
+            builder.Logging.ClearProviders();
+            builder.Logging.AddSerilog();
+
             string? redisConn = builder.Configuration.GetConnectionString("Redis");
 
             if (string.IsNullOrWhiteSpace(redisConn))
@@ -30,16 +35,26 @@ internal static class Program
 
             builder.Services.AddSingleton<IConnectionMultiplexer>(ConnectionMultiplexer.Connect(redisConn));
 
+            builder.Services.ConfigureHttpJsonOptions(options =>
+            {
+                /*options.SerializerOptions.Converters.Add(new DateTimeConverter());
+                options.SerializerOptions.Converters.Add(new DateTimeNullableConverter());
+                options.SerializerOptions.Converters.Add(new DoubleConverter());*/
+            });
+
+            builder.Services.AddSingleton<ICompareLogic>(new CompareLogic(new ComparisonConfig()
+            {
+                MaxDifferences = 3
+            }));
+
             builder.Services.AddSingleton<LedManager>();
             builder.Services.AddSingleton<LedOperator>();
-            builder.Services.AddHostedService<LedCheckService>();
-            builder.Services.AddHostedService<LedDisplayService>();
+            builder.Services.AddSingleton<LedCheckService>();
+            builder.Services.AddSingleton<LedDisplayService>();
 
-            builder.Logging.ClearProviders();
-            builder.Logging.AddSerilog();
+            builder.Services.AddHostedService<LedHostedService>();
 
             IHost host = builder.Build();
-
             host.Run();
         }
         catch (Exception e)

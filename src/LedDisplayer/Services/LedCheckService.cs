@@ -1,102 +1,163 @@
-﻿using System.Text.Json;
+﻿using System.Net.NetworkInformation;
+using System.Text.Json;
+using KellermanSoftware.CompareNetObjects;
 using LedDisplayer.Models;
 using StackExchange.Redis;
 
 // ReSharper disable InvertIf
 
-namespace LedDisplayer.Services;
+namespace LedDisplayer;
 
-public sealed class LedCheckService : BackgroundService
+public sealed class LedCheckService
 {
     private readonly LedManager _ledManager;
-    private readonly IDatabase _database;
+    private readonly IConnectionMultiplexer _connectionMultiplexer;
     private readonly IConfiguration _configuration;
-    private readonly ILogger<LedDisplayService> _logger;
+    private readonly ICompareLogic _compareLogic;
+    private readonly ILogger<LedCheckService> _logger;
 
-    private bool _isInitialized;
+    private static readonly List<bool> Changed = new List<bool>();
 
-    public LedCheckService(LedManager ledManager, IConfiguration configuration, IConnectionMultiplexer connectionMultiplexer, ILogger<LedDisplayService> logger)
+    public LedCheckService(LedManager ledManager, IConnectionMultiplexer connectionMultiplexer, IConfiguration configuration, ICompareLogic compareLogic, ILogger<LedCheckService> logger)
     {
         _ledManager = ledManager;
-        _database = connectionMultiplexer.GetDatabase();
+        _connectionMultiplexer = connectionMultiplexer;
         _configuration = configuration;
+        _compareLogic = compareLogic;
         _logger = logger;
     }
 
-    public override Task StartAsync(CancellationToken cancellationToken)
+
+    public void DoWork(object? state)
     {
-        IList<Led>? list = GetLedsFromRedis();
+        IList<Led>? list = GetLedListFromRedis();
+
+        Changed.Clear();
 
         if (list != null)
         {
-            _ledManager.Initialize(list);
+            Check(list);
+
+            PingTest();
+
+            if (Changed.Any(_ => true))
+            {
+                if (_ledManager.FaultyLeds.IsEmpty)
+                {
+                    _logger.LogInformation("Current total led count: {LedTotalCount}, Faulty led count: {FaultyCount}", _ledManager.TotalLeds.Count, _ledManager.FaultyLeds.Count);
+                }
+                else
+                {
+                    _logger.LogInformation("Current total led count: {LedTotalCount}, Faulty led count: {FaultyCount}, Faulty leds: {FaultyLeds}",
+                        _ledManager.TotalLeds.Count,
+                        _ledManager.FaultyLeds.Count,
+                        _ledManager.FaultyLeds.Select(c => c.Key));
+                }
+            }
         }
-
-        _isInitialized = true;
-
-        return base.StartAsync(cancellationToken);
     }
 
-    private IList<Led>? GetLedsFromRedis()
+    private void Check(IList<Led> list)
     {
-        string ledListKeyFromRedis = _configuration.GetValue<string>("Led:LedListKeyFromRedis", "LedList");
-
-        RedisValue redisValue = _database.StringGet(ledListKeyFromRedis);
-
-        if (redisValue.HasValue)
+        foreach (Led led in list)
         {
+            _ledManager.TotalLeds.TryGetValue(led.OptionId, out Led? oldLed);
+
+            if (oldLed is null)
+            {
+                bool result = _ledManager.TotalLeds.TryAdd(led.OptionId, led);
+
+                if (result)
+                {
+                    _logger.LogInformation("Added led id: '{LedId}'", led.OptionId);
+                }
+
+                Changed.Add(result);
+            }
+            //else if (oldLed.OptionName != led.OptionName || oldLed.OptionIp != led.OptionIp)
+            else if (!_compareLogic.Compare(oldLed, led).AreEqual)
+            {
+                bool result = _ledManager.TotalLeds.TryUpdate(led.OptionId, led, oldLed);
+
+                if (result)
+                {
+                    _logger.LogInformation("Updated led id: '{LedId}'", led.OptionId);
+                }
+
+                Changed.Add(result);
+            }
+        }
+
+        IEnumerable<KeyValuePair<int, Led>> canRemoveLeds = _ledManager.TotalLeds.Where(c => list.All(l => l.OptionId != c.Key)).ToList();
+
+        foreach (KeyValuePair<int, Led> pair in canRemoveLeds)
+        {
+            bool result = _ledManager.TotalLeds.TryRemove(pair.Value.OptionId, out _);
+
+            if (result)
+            {
+                _logger.LogInformation("Removed led id: '{LedId}'", pair.Value.OptionId);
+            }
+
+            Changed.Add(result);
+        }
+    }
+
+    private void PingTest()
+    {
+        using (Ping pingSender = new Ping())
+        {
+            foreach (KeyValuePair<int, Led> led in _ledManager.TotalLeds)
+            {
+                try
+                {
+                    PingReply reply = pingSender.Send(led.Value.OptionIp);
+
+                    if (reply.Status == IPStatus.Success)
+                    {
+                        _ledManager.NormalLeds.TryAdd(led.Key, led.Value);
+                        _ledManager.FaultyLeds.TryRemove(led.Key, out Led _);
+                    }
+                    else
+                    {
+                        _ledManager.NormalLeds.TryRemove(led.Key, out Led _);
+                        _ledManager.FaultyLeds.TryAdd(led.Key, led.Value);
+                    }
+                }
+                catch
+                {
+                    _ledManager.NormalLeds.TryRemove(led.Key, out Led _);
+                    _ledManager.FaultyLeds.TryAdd(led.Key, led.Value);
+                }
+            }
+        }
+    }
+
+    private IList<Led>? GetLedListFromRedis()
+    {
+        string? ledListKeyFromRedis = _configuration.GetValue<string>("Led:LedListKeyFromRedis", "LedList");
+
+        if (string.IsNullOrWhiteSpace(ledListKeyFromRedis))
+        {
+            return null;
+        }
+
+        try
+        {
+            RedisValue redisValue = _connectionMultiplexer.GetDatabase(0).StringGet(ledListKeyFromRedis);
+
+            if (!redisValue.HasValue)
+            {
+                return null;
+            }
+
             IList<Led>? list = JsonSerializer.Deserialize<IEnumerable<Led>>(redisValue.ToString())?.ToList();
             return list;
         }
-
-        return null;
-    }
-
-    /// <inheritdoc />
-    // ReSharper disable once CognitiveComplexity
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        while (!stoppingToken.IsCancellationRequested && _isInitialized)
+        catch (Exception e)
         {
-            bool checkUpdate = _configuration.GetValue<bool>("Led:CheckUpdate", true);
-
-            if (checkUpdate)
-            {
-                IList<Led>? list = GetLedsFromRedis();
-
-                if (list != null)
-                {
-                    foreach (Led led in list)
-                    {
-                        Led? oldLed = _ledManager.Get(led.Id);
-
-                        if (oldLed is null)
-                        {
-                            _ledManager.Add(led);
-                        }
-                        else if (oldLed.Name != led.Name || oldLed.Ip != led.Ip)
-                        {
-                            _ledManager.Update(led);
-                        }
-                    }
-
-                    IEnumerable<KeyValuePair<string, Led>> canRemoveLeds = _ledManager.Leds.Where(c => list.All(l => l.Id != c.Key));
-
-                    foreach (KeyValuePair<string, Led> led in canRemoveLeds)
-                    {
-                        _ledManager.Remove(led.Key);
-                    }
-                }
-            }
-
-            await Task.Delay(TimeSpan.FromSeconds(15), stoppingToken);
+            _logger.LogError(e, "Failed to get redis => '{LedListKeyFromRedis}', error message: {ErrorMessage}", ledListKeyFromRedis, e.Message);
+            return null;
         }
-    }
-
-    public override Task StopAsync(CancellationToken cancellationToken)
-    {
-        _ledManager.Clear();
-
-        return base.StopAsync(cancellationToken);
     }
 }

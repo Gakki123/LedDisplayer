@@ -1,11 +1,11 @@
 ﻿using System.Collections.Concurrent;
 using LedDisplayer.Models;
 
-namespace LedDisplayer.Services;
+namespace LedDisplayer;
 
 public sealed class LedOperator
 {
-    public ConcurrentDictionary<string, Led> Leds => LedManager.Leds;
+    public ConcurrentDictionary<int, Led> Leds => LedManager.TotalLeds;
 
     private LedManager LedManager { get; }
 
